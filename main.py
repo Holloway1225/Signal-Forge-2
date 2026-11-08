@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from lyric_architect import router as lyric_router
 
 app = FastAPI(title="Suno Prompt Machine API", version="1.0.0")
+app.include_router(lyric_router)
 origins = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 MAX_AUDIO_BYTES = 12 * 1024 * 1024
