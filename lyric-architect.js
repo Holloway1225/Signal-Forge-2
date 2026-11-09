@@ -2,105 +2,115 @@
 (() => {
   const $ = id => document.getElementById(id);
 
-  const panel = document.createElement("section");
-  panel.className = "panel";
-  panel.id = "lyricArchitect";
+  // Use the existing Lyric Architect in index.html.
+  // Never create a duplicate section.
+  const panel = $("lyricArchitect");
 
-  panel.innerHTML = `
-    <div class="section-title">04 / LYRIC ARCHITECT</div>
-    <h2>AI Lyric Architect</h2>
-    <p>Paste finished lyrics and add Suno production tags without rewriting your words.</p>
+  if (!panel) {
+    console.error("Lyric Architect section not found.");
+    return;
+  }
 
-    <label>Finished lyrics
-      <textarea id="architectLyrics" rows="14"
-        placeholder="[Verse 1]&#10;Paste your lyrics here..."></textarea>
-    </label>
+  const button = $("architectGenerate");
+  const status = $("architectStatus");
+  const results = $("architectResults");
 
-    <label>Production style
-      <textarea id="architectSound" rows="3"
-        placeholder="Dark atmospheric alternative metal, intimate verses, crushing choruses, melodic guitar solo"></textarea>
-    </label>
+  if (!button || !status || !results) {
+    console.error("Lyric Architect elements missing.");
+    return;
+  }
 
-    <label class="check">
-      <input id="architectPreserve" type="checkbox" checked>
-      Preserve original lyrics
-    </label>
+  // Prevent accidental double initialization.
+  if (button.dataset.initialized === "true") return;
+  button.dataset.initialized = "true";
 
-    <label class="check">
-      <input id="architectInstrumentals" type="checkbox" checked>
-      Add instrumental sections
-    </label>
-
-    <button id="architectGenerate" class="primary" type="button">
-      ARCHITECT LYRICS →
-    </button>
-
-    <div id="architectStatus" role="status" aria-live="polite"></div>
-
-    <div id="architectResults" hidden>
-      <div class="output-head">
-        <h2>Suno-Ready Lyrics</h2>
-        <button id="architectCopy" type="button">Copy</button>
-      </div>
-      <pre id="architectOutput" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
-      <small id="architectCount"></small>
-    </div>
-  `;
-
-  const footer = document.querySelector("footer");
-  if (footer) footer.before(panel);
-  else document.querySelector("main")?.append(panel);
-
-  $("architectGenerate").addEventListener("click", async () => {
+  button.addEventListener("click", async () => {
     const lyrics = $("architectLyrics").value.trim();
     const sound = $("architectSound").value.trim();
-    const backend = $("backend")?.value.trim().replace(/\/+$/, "");
-    const status = $("architectStatus");
-    const button = $("architectGenerate");
+
+    const backend = $("backend").value
+      .trim()
+      .replace(/\/+$/, "");
 
     if (!lyrics) {
-      status.textContent = "Paste your lyrics first.";
+      status.textContent = "Paste your finished lyrics first.";
       return;
     }
 
-    if (!backend || !/^https:\/\//i.test(backend)) {
-      status.textContent = "Enter your HTTPS backend URL at the bottom of the page.";
+    if (lyrics.length > 5000) {
+      status.textContent =
+        "Lyrics exceed 5,000 characters. Shorten them before generating.";
       return;
     }
+
+    if (!backend || !/^https?:\/\//i.test(backend)) {
+      status.textContent =
+        "Enter your Render backend URL at the bottom of the page.";
+      return;
+    }
+
+    const preserveLyrics = $("architectPreserve").checked;
+    const addInstrumentals = $("architectInstrumentals").checked;
 
     button.disabled = true;
     status.textContent = "Architecting lyrics...";
-    $("architectResults").hidden = true;
+    results.hidden = true;
 
     try {
-      const response = await fetch(`${backend}/api/tag-lyrics`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          lyrics,
-          sound,
-          preserve_lyrics: $("architectPreserve").checked,
-          add_instrumentals: $("architectInstrumentals").checked
-        })
-      });
+      const response = await fetch(
+        `${backend}/api/tag-lyrics`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            lyrics: lyrics,
+            sound: sound,
+            preserve_lyrics: preserveLyrics,
+            add_instrumentals: addInstrumentals
+          })
+        }
+      );
 
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(typeof data.detail === "string"
-          ? data.detail : `Server error ${response.status}`);
+        let message = `Server error ${response.status}`;
+
+        if (typeof data.detail === "string") {
+          message = data.detail;
+        } else if (Array.isArray(data.detail)) {
+          message = data.detail
+            .map(item => item.msg || JSON.stringify(item))
+            .join("; ");
+        }
+
+        throw new Error(message);
       }
 
       if (typeof data.tagged_lyrics !== "string") {
-        throw new Error("Missing tagged lyrics in response.");
+        throw new Error("Backend did not return tagged lyrics.");
       }
 
       $("architectOutput").textContent = data.tagged_lyrics;
-      $("architectCount").textContent =
-        `${data.tagged_lyrics.length} / 5000 characters`;
 
-      $("architectResults").hidden = false;
-      status.textContent = "Lyrics ready.";
+      const count = data.tagged_lyrics.length;
+
+      $("architectCount").textContent =
+        `${count} / 5000 characters`;
+
+      results.hidden = false;
+
+      status.textContent =
+        count > 5000
+          ? "Lyrics generated, but output exceeds Suno's 5,000-character limit."
+          : "Lyrics successfully architected.";
+
+      results.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+      });
 
     } catch (error) {
       status.textContent = `Error: ${error.message}`;
@@ -110,13 +120,16 @@
   });
 
   $("architectCopy").addEventListener("click", async () => {
-    const value = $("architectOutput").textContent;
+    const text = $("architectOutput").textContent;
+
+    if (!text) return;
+
     try {
-      await navigator.clipboard.writeText(value);
-      $("architectStatus").textContent = "Copied to clipboard.";
+      await navigator.clipboard.writeText(text);
+      status.textContent = "Copied to clipboard.";
     } catch {
-      $("architectStatus").textContent =
-        "Copy failed. Select and copy the lyrics manually.";
+      status.textContent =
+        "Copy failed. Select the lyrics and copy manually.";
     }
   });
 })();
