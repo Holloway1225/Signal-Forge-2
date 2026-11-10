@@ -1,12 +1,14 @@
 
-"""Signal Forge backend: Gemini YouTube analysis, Last.fm, OpenAI."""
+"""Signal Forge 2 — reference-first Suno production engine."""
+
 import asyncio
 import io
 import json
 import os
+import re
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse, parse_qs
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -15,16 +17,17 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from lyric_architect import router as lyric_router
 
-app = FastAPI(title="Signal Forge API", version="1.2.0")
+
+app = FastAPI(title="Signal Forge API", version="1.3.0")
 app.include_router(lyric_router)
 
 origins = [
-    x.strip()
-    for x in os.getenv(
+    value.strip()
+    for value in os.getenv(
         "ALLOWED_ORIGINS",
         "http://localhost:8080,http://127.0.0.1:8080"
     ).split(",")
-    if x.strip()
+    if value.strip()
 ]
 
 app.add_middleware(
@@ -36,84 +39,218 @@ app.add_middleware(
 
 MAX_AUDIO_BYTES = 12 * 1024 * 1024
 
+SECTIONS = (
+    "intro", "verse", "pre_chorus", "chorus",
+    "bridge", "instrumental", "outro"
+)
+
+ANALYSIS_FIELDS = (
+    "vocals", "instrumentation", "rhythm",
+    "dynamics", "production", "emotion", "evidence"
+)
+
 
 class PromptRequest(BaseModel):
     song: str = Field(default="", max_length=200)
     artist: str = Field(default="", max_length=200)
     notes: str = Field(default="", max_length=3000)
-    vocals: str = Field(default="deep male clean vocals", max_length=200)
+    vocals: str = Field(
+        default="deep male clean vocals",
+        max_length=200
+    )
     intensity: int = Field(default=7, ge=1, le=10)
     atmosphere: int = Field(default=8, ge=1, le=10)
-    mode: str = Field(default="cryptid", pattern="^(cryptid|neutral)$")
+    mode: str = Field(
+        default="cryptid",
+        pattern="^(cryptid|neutral)$"
+    )
 
 
-SYSTEM = """You are Signal Forge, a careful music-production
-researcher and Suno prompt designer.
+SYSTEM = """
+You are Signal Forge, a specialist in reference-informed
+music production analysis and Suno prompt engineering.
 
-When gemini_audio_analysis is supplied, it is PRIMARY
-recording-based evidence and outranks Last.fm tags and defaults.
-Describe specific instrument timbres, electronic grooves,
-arrangement changes and vocal delivery from that report,
-not from genre assumptions.
+Your primary goal is to translate specific musical evidence
+into an actionable production blueprint for an ORIGINAL song.
 
-Return ONLY JSON with keys:
-analysis: object with vocals, instrumentation, rhythm,
-dynamics, production, emotion, evidence;
-style_prompt: string at most 1000 characters;
-section_tags: object with intro, verse, pre_chorus,
-chorus, bridge, instrumental, outro;
-caveat: string.
+EVIDENCE PRIORITY:
+1. Gemini listening report from an actual recording.
+2. User-supplied descriptions of the sound.
+3. Last.fm metadata and genre tags.
+4. Clearly labeled creative suggestions.
 
-PRIORITY: Reproduce the musical production CHARACTERISTICS
-of the user's reference, NOT a generic house sound.
+NEVER replace distinctive reference characteristics with
+generic alternative metal or Cryptid Static defaults.
 
-Reference evidence outranks mode and preset preferences.
-If genre tags suggest electronic, pop, R&B, hip-hop,
-industrial, or other elements, do not replace them
-with generic alternative metal.
+Do not claim to have listened when no listening report exists.
 
-Describe contrasting section textures and transitions
-when supported.
+Never invent exact BPM, tuning, key, or section structures
+as facts without evidence.
 
-Do not inject static, atmospheric synths, crushing guitars,
-guitar solos, or other Cryptid Static defaults unless
-evidence or user notes support them.
+USER PREFERENCES:
+Intensity, atmosphere, vocal approach and Cryptid Static
+mode are adaptation preferences, not evidence about
+the reference recording.
 
-Cryptid mode is a light preference for emotionally
-expressive clean vocals and no screaming,
-not a genre override.
+Cryptid Static mode must not automatically introduce
+static, synth pads, chugging guitars, half-time breakdowns,
+or guitar solos. Only use these when the listening evidence
+or explicit user instructions support them.
 
-Last.fm tags and metadata are descriptive metadata,
-NOT recording analysis. They may be broad, user-generated,
-or missing.
+SUNO STYLE PROMPT:
+- Maximum 1000 characters.
+- Aim for 600-900 characters when supported by the evidence.
+- Do not pad with generic filler to meet a character target.
+- Write concrete musical production language.
+- Describe vocal register, phrasing and delivery.
+- Describe actual drum groove and rhythmic feel.
+- Describe guitar and bass textures and their placement.
+- Describe electronic sounds and sound design if supported.
+- Describe changes from verses into choruses.
+- Describe production depth, dynamics and transitions.
+- Prioritize the reference's DISTINCTIVE traits.
+- Avoid artist names, lyrical themes and vague adjectives.
+- Do not imitate a specific singer's identity.
+- Never reproduce existing lyrics or melodies.
+- No introductory phrases like "Create a track".
+- Make the result immediately pasteable into Suno.
 
-Never claim to have heard or measured the recording
-for metadata-only input.
+SECTION TAGS:
+Return seven bracketed musical instructions:
+intro, verse, pre_chorus, chorus, bridge, instrumental, outro.
 
-Do not invent exact guitar tuning, instruments,
-vocal techniques, beats, BPM, production details,
-song structure, or transitions as verified facts.
+Each tag should be concise but musically descriptive.
+Usually 8-22 words when the evidence supports that detail.
 
-Where reliable detail is missing, explicitly state that
-the arrangement is a creative interpretation rather
-than a faithful sonic transcription.
+Include combinations of:
+- instrumentation
+- rhythmic groove
+- vocal delivery
+- dynamics
+- electronic textures
+- transitions
 
-Make style_prompt compact, immediately usable in Suno,
-with the strongest supported sonic traits first.
+Bad: [powerful release]
+Bad: [dynamic shift]
+Bad: [heavy riff]
+Bad: [anthemic]
 
-Avoid artist names and imitation of a particular
-singer's identity. Never recreate copyrighted lyrics
-or melodies.
+Better:
+[Explosive syncopated guitars, tight electronic kick,
+wide melodic clean vocals, layered harmonies]
 
-Each section tag must be a short bracketed musical
-direction, not prose paragraphs or lyrics.
+Do not use identical instructions for different sections.
+Do not invent a reference section that was not identified.
+For missing sections, propose a fitting original-song
+arrangement and label that choice in the caveat.
 
-Never fabricate precision not present in the input.
-If the reference is not found, disclose that.
+ANALYSIS:
+The seven analysis fields MUST each be plain text strings.
+Never put objects, arrays or JSON inside analysis fields.
+Explain the most distinctive production observations.
+
+EVIDENCE:
+Distinguish what Gemini reported from metadata-based
+inferences and user preferences.
+
+CAVEAT:
+Briefly state uncertainties and whether the recording
+was actually processed.
+
+Return ONLY a JSON object with:
+{
+ "analysis": {
+   "vocals": "...",
+   "instrumentation": "...",
+   "rhythm": "...",
+   "dynamics": "...",
+   "production": "...",
+   "emotion": "...",
+   "evidence": "..."
+ },
+ "style_prompt": "...",
+ "section_tags": {
+   "intro": "[...]",
+   "verse": "[...]",
+   "pre_chorus": "[...]",
+   "chorus": "[...]",
+   "bridge": "[...]",
+   "instrumental": "[...]",
+   "outro": "[...]"
+ },
+ "caveat": "..."
+}
 """
 
 
-def _lastfm_get(params: dict[str, str]) -> dict[str, Any]:
+GEMINI_PROMPT = """
+You are analyzing the ACTUAL AUDIO of a YouTube recording
+to help design an original song with similar production
+characteristics.
+
+Analyze only what you can reasonably hear.
+Do not use genre stereotypes to fill missing details.
+Do not reproduce lyrics or melodies.
+
+First identify whether the recording appears to be:
+- official studio recording
+- live performance
+- cover or remix
+- commentary or unrelated video
+- uncertain
+
+Describe the audible music in detail.
+
+1. VOCALS
+Register, clean or harsh delivery, sung versus spoken
+phrasing, rhythmic articulation, harmonies, processing,
+and changes between sections.
+
+2. DRUMS AND GROOVE
+Electronic versus acoustic percussion, kick and snare,
+hi-hats, programmed patterns, 808 or sub-bass if audible,
+syncopation, groove and rhythmic contrast.
+
+3. GUITARS AND BASS
+Distortion, guitar tone, riff patterns, clean layers,
+palm muting, low-end movement and how the instruments
+interact with electronic elements.
+
+4. ELECTRONIC PRODUCTION
+Synths, glitches, sampled textures, effects, ambience,
+drops, transitions and sound design.
+
+5. ARRANGEMENT
+Identify intro, verses, pre-choruses, choruses, bridge,
+instrumental and outro ONLY when distinguishable.
+Describe what each section sounds like.
+Mention timestamps only when confident.
+
+6. DYNAMICS AND MIX
+How the recording moves between restrained and heavy
+passages, changes in density, vocal prominence, reverb,
+delay, stereo width and overall production.
+
+7. SIGNATURE SOUND
+Identify 5-8 distinctive audible traits that separate
+this recording from a generic genre description.
+
+8. UNCERTAINTY
+Identify anything you could not reliably hear.
+
+Do not claim specific BPM, key, tuning, instrument
+models or technical processing without evidence.
+
+Do not say merely "heavy guitars", "powerful chorus",
+"dynamic shift", or "atmospheric textures".
+Explain what is actually producing those effects.
+
+If the audio cannot be accessed or meaningfully analyzed,
+say that explicitly instead of guessing.
+"""
+
+
+def _lastfm_get(params: dict) -> dict:
     query = urlencode({
         **params,
         "api_key": os.environ["LASTFM_API_KEY"],
@@ -123,119 +260,86 @@ def _lastfm_get(params: dict[str, str]) -> dict[str, Any]:
 
     req = Request(
         "https://ws.audioscrobbler.com/2.0/?" + query,
-        headers={
-            "User-Agent": "SignalForge/1.2 (music metadata)"
-        }
+        headers={"User-Agent": "SignalForge/1.3"}
     )
 
     with urlopen(req, timeout=9) as response:
         return json.load(response)
 
 
-def _tag_names(raw: Any, limit: int = 12) -> list[str]:
-    if isinstance(raw, dict):
-        raw = raw.get("tag", [])
+def _tags(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        value = value.get("tag", [])
 
-    if isinstance(raw, dict):
-        raw = [raw]
+    if isinstance(value, dict):
+        value = [value]
 
-    if not isinstance(raw, list):
+    if not isinstance(value, list):
         return []
 
     return [
         str(item["name"])[:80]
-        for item in raw
+        for item in value
         if isinstance(item, dict) and item.get("name")
-    ][:limit]
+    ][:12]
 
 
-def _lookup_lastfm(song: str, artist: str) -> dict[str, Any]:
+def lookup_lastfm(song: str, artist: str) -> dict:
     if not os.getenv("LASTFM_API_KEY"):
-        return {
-            "status": "not_configured",
-            "message": "LASTFM_API_KEY not configured"
-        }
+        return {"status": "not_configured"}
 
     if not song or not artist:
-        return {
-            "status": "not_queried",
-            "message": "Song title and artist are required"
-        }
+        return {"status": "not_queried"}
 
     try:
-        track = _lastfm_get({
+        result = _lastfm_get({
             "method": "track.getInfo",
             "track": song,
             "artist": artist
         })
 
-        if "error" in track or not isinstance(
-            track.get("track"), dict
-        ):
-            return {
-                "status": "not_found",
-                "message": "Last.fm did not identify this track"
-            }
+        track = result.get("track")
 
-        item = track["track"]
-        track_artist = item.get("artist", {})
+        if not isinstance(track, dict):
+            return {"status": "not_found"}
 
-        if isinstance(track_artist, dict):
-            track_artist = track_artist.get("name", artist)
+        artist_data = track.get("artist", {})
+        artist_name = (
+            artist_data.get("name", artist)
+            if isinstance(artist_data, dict)
+            else str(artist_data)
+        )
 
-        result = {
+        metadata = {
             "status": "found",
-            "track": str(item.get("name", song))[:200],
-            "artist": str(track_artist)[:200],
-            "track_tags": _tag_names(item.get("toptags")),
-            "album": (
-                str(item["album"].get("title", ""))[:200]
-                if isinstance(item.get("album"), dict)
-                else ""
-            ),
-            "duration_ms": item.get("duration"),
-            "source": "Last.fm track.getInfo"
+            "track": track.get("name", song),
+            "artist": artist_name,
+            "track_tags": _tags(track.get("toptags")),
+            "source": "Last.fm"
         }
 
-        if not result["track_tags"]:
+        if not metadata["track_tags"]:
             try:
                 artist_info = _lastfm_get({
                     "method": "artist.getTopTags",
-                    "artist": str(track_artist)
+                    "artist": artist_name
                 })
-                result["artist_tags"] = _tag_names(
+                metadata["artist_tags"] = _tags(
                     artist_info.get("toptags")
                 )
-            except (
-                HTTPError, URLError, TimeoutError,
-                ValueError, OSError
-            ):
-                result["artist_tags"] = []
+            except Exception:
+                metadata["artist_tags"] = []
 
-        return result
+        return metadata
 
-    except (
-        HTTPError, URLError, TimeoutError,
-        ValueError, OSError
-    ) as exc:
-        return {
-            "status": "unavailable",
-            "message": (
-                "Last.fm lookup unavailable "
-                f"({type(exc).__name__})"
-            )
-        }
+    except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+        return {"status": "unavailable"}
 
 
-def _youtube_url(value: str) -> str | None:
-    candidate = value.strip()
+def youtube_url(value: str) -> str | None:
+    parsed = urlparse(value.strip())
 
-    if not candidate:
-        return None
-
-    parsed = urlparse(candidate)
-
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in ("https", "http"):
         return None
 
     host = (parsed.hostname or "").lower()
@@ -251,108 +355,34 @@ def _youtube_url(value: str) -> str | None:
             video_id = parse_qs(
                 parsed.query
             ).get("v", [None])[0]
-
         elif parsed.path.startswith(
             ("/shorts/", "/live/", "/embed/")
         ):
-            video_id = parsed.path.split("/")[2]
+            parts = parsed.path.split("/")
+            if len(parts) > 2:
+                video_id = parts[2]
 
     elif host in ("youtu.be", "www.youtu.be"):
         video_id = parsed.path.strip("/").split("/")[0]
 
-    if (
-        not video_id
-        or len(video_id) != 11
-        or not all(
-            c.isalnum() or c in "-_"
-            for c in video_id
-        )
+    if not video_id or not re.fullmatch(
+        r"[A-Za-z0-9_-]{11}", video_id
     ):
         return None
 
-    return (
-        "https://www.youtube.com/watch?v=" + video_id
-    )
+    return "https://www.youtube.com/watch?v=" + video_id
 
 
-GEMINI_AUDIO_PROMPT = """
-Analyze the MUSIC ACTUALLY AUDIBLE in this YouTube
-recording for an original-song production blueprint.
-
-Focus on audio, not visuals, reputation, titles,
-or genre stereotypes.
-
-Do not reproduce lyrics or melodies.
-
-Provide a detailed analysis covering:
-
-IDENTITY:
-Is this a studio recording, live performance,
-cover, remix, commentary, or alternate version?
-Mention uncertainty.
-
-VOCALS:
-Sung or spoken delivery, register, clean or harsh,
-articulation, phrasing, layering, and changes
-across sections.
-
-DRUMS AND GROOVE:
-Acoustic/electronic drums, kick, snare,
-hi-hat, 808, sub-bass, rhythmic feel,
-syncopation and perceived speed.
-Do not invent exact BPM.
-
-GUITARS AND BASS:
-Audible timbre, density, distortion,
-rhythmic placement and bass behavior.
-Express uncertainty when sounds overlap.
-
-SYNTHS AND EFFECTS:
-Electronic sound design, glitches,
-pads, transitions, ambience and effects,
-only when audible.
-
-SECTION TIMELINE:
-Intro, verse, prechorus, chorus, bridge,
-instrumental and outro when identifiable.
-Describe each section's distinct texture.
-Give timestamps only when supported.
-Do not invent missing sections.
-
-DYNAMICS AND MIX:
-Builds, drops, space, stereo impression,
-compression impression and contrast.
-
-SIGNATURE:
-Five to eight SPECIFIC production traits
-distinguishing this recording from
-generic alternative metal.
-
-UNCERTAINTY:
-Anything that cannot reliably be distinguished.
-
-Avoid vague descriptions such as powerful,
-dynamic, or atmospheric without identifying
-what creates that effect.
-
-If the recording cannot be accessed or
-meaningfully analyzed, explicitly say so.
-"""
-
-
-def _gemini_listen(youtube_url: str) -> dict[str, Any]:
-    key = os.getenv("GEMINI_API_KEY", "")
+def gemini_listen(url: str) -> dict:
+    key = os.getenv("GEMINI_API_KEY")
 
     if not key:
         return {
-            "status": "not_configured",
+            "status": "failed",
             "error": "GEMINI_API_KEY is missing in Render"
         }
 
-    model = os.getenv(
-        "GEMINI_MODEL",
-        "gemini-2.5-flash"
-    )
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     endpoint = (
         "https://generativelanguage.googleapis.com/"
@@ -362,19 +392,13 @@ def _gemini_listen(youtube_url: str) -> dict[str, Any]:
     body = {
         "contents": [{
             "parts": [
-                {
-                    "file_data": {
-                        "file_uri": youtube_url
-                    }
-                },
-                {
-                    "text": GEMINI_AUDIO_PROMPT
-                }
+                {"file_data": {"file_uri": url}},
+                {"text": GEMINI_PROMPT}
             ]
         }],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2200
+            "maxOutputTokens": 3500
         }
     }
 
@@ -392,82 +416,124 @@ def _gemini_listen(youtube_url: str) -> dict[str, Any]:
         with urlopen(req, timeout=110) as response:
             data = json.load(response)
 
-        pieces = [
+        report = "\n".join(
             part.get("text", "")
             for candidate in data.get("candidates", [])
-            for content in [candidate.get("content", {})]
-            for part in content.get("parts", [])
+            for part in candidate.get(
+                "content", {}
+            ).get("parts", [])
             if isinstance(part, dict)
-        ]
-
-        report = "\n".join(pieces).strip()
+        ).strip()
 
         if len(report) < 150:
             return {
                 "status": "failed",
-                "error": (
-                    "Gemini did not return a usable "
-                    "music analysis"
-                )
+                "error": "Gemini returned insufficient analysis"
             }
 
         return {
             "status": "analyzed",
-            "source": "Gemini video/audio input",
             "model": model,
-            "youtube_url": youtube_url,
-            "report": report[:12500]
+            "url": url,
+            "report": report[:18000]
         }
 
     except HTTPError as exc:
         return {
             "status": "failed",
             "error": (
-                f"Gemini returned HTTP {exc.code}; "
-                "check model access, quotas, and "
-                "whether the video is public"
+                f"Gemini HTTP {exc.code}. "
+                "Check quota, model access, and video availability."
             )
         }
 
-    except (
-        URLError, TimeoutError, ValueError, OSError
-    ) as exc:
+    except (URLError, TimeoutError, ValueError, OSError) as exc:
         return {
             "status": "failed",
-            "error": (
-                "Gemini request failed "
-                f"({type(exc).__name__})"
-            )
+            "error": f"Gemini request failed: {type(exc).__name__}"
         }
 
 
-async def generate(payload: dict):
+def flatten_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, dict):
+        return "; ".join(
+            f"{key.replace('_', ' ')}: {flatten_text(item)}"
+            for key, item in value.items()
+            if item is not None
+        )
+
+    if isinstance(value, list):
+        return "; ".join(flatten_text(item) for item in value)
+
+    if value is None:
+        return ""
+
+    return str(value)
+
+
+def clean_result(data: dict) -> dict:
+    analysis = data.get("analysis")
+
+    if not isinstance(analysis, dict):
+        analysis = {}
+
+    data["analysis"] = {
+        key: flatten_text(analysis.get(key, ""))
+        for key in ANALYSIS_FIELDS
+    }
+
+    tags = data.get("section_tags")
+
+    if not isinstance(tags, dict):
+        tags = {}
+
+    cleaned_tags = {}
+
+    for section in SECTIONS:
+        value = flatten_text(tags.get(section, ""))
+
+        if not value:
+            value = "Production direction not established"
+
+        if not value.startswith("["):
+            value = "[" + value
+
+        if not value.endswith("]"):
+            value += "]"
+
+        cleaned_tags[section] = value
+
+    data["section_tags"] = cleaned_tags
+    data["caveat"] = flatten_text(data.get("caveat", ""))
+    data["style_prompt"] = flatten_text(
+        data.get("style_prompt", "")
+    )
+
+    return data
+
+
+async def generate(payload: dict) -> dict:
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(
             503,
-            "OPENAI_API_KEY is not configured"
+            "OPENAI_API_KEY is missing in Render"
         )
 
     client = AsyncOpenAI(
         api_key=os.environ["OPENAI_API_KEY"],
-        timeout=45.0
+        timeout=60.0
     )
 
     try:
         result = await client.chat.completions.create(
-            model=os.getenv(
-                "OPENAI_MODEL",
-                "gpt-4o-mini"
-            ),
-            temperature=0.35,
-            response_format={
-                "type": "json_object"
-            },
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.3,
+            response_format={"type": "json_object"},
             messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM
-                },
+                {"role": "system", "content": SYSTEM},
                 {
                     "role": "user",
                     "content": json.dumps(payload)
@@ -479,31 +545,26 @@ async def generate(payload: dict):
             result.choices[0].message.content or "{}"
         )
 
-        if (
-            not isinstance(data.get("style_prompt"), str)
-            or not isinstance(
-                data.get("section_tags"), dict
-            )
-        ):
-            raise ValueError("Incomplete model output")
+        if not isinstance(data, dict):
+            raise ValueError("Invalid AI output")
+
+        data = clean_result(data)
+
+        if not data["style_prompt"]:
+            raise ValueError("Missing style prompt")
 
         if len(data["style_prompt"]) > 1000:
-            shortened = await client.chat.completions.create(
-                model=os.getenv(
-                    "OPENAI_MODEL",
-                    "gpt-4o-mini"
-                ),
-                response_format={
-                    "type": "json_object"
-                },
+            shorter = await client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "Return JSON with exactly one key "
-                            "style_prompt. Compress to at most "
-                            "1000 characters, retaining "
-                            "evidence-supported production detail."
+                            "Return JSON with one key: style_prompt. "
+                            "Rewrite the supplied Suno style prompt "
+                            "to at most 1000 characters. Preserve "
+                            "the most distinctive evidenced sounds."
                         )
                     },
                     {
@@ -513,9 +574,17 @@ async def generate(payload: dict):
                 ]
             )
 
-            data["style_prompt"] = json.loads(
-                shortened.choices[0].message.content or "{}"
-            )["style_prompt"][:1000]
+            compressed = json.loads(
+                shorter.choices[0].message.content or "{}"
+            ).get("style_prompt", "")
+
+            if not isinstance(compressed, str):
+                raise ValueError("Invalid compressed prompt")
+
+            if len(compressed) > 1000:
+                raise ValueError("Prompt remains over 1000 characters")
+
+            data["style_prompt"] = compressed
 
         return data
 
@@ -533,6 +602,7 @@ async def generate(payload: dict):
 def health():
     return {
         "ok": True,
+        "version": "1.3.0",
         "lastfm_configured": bool(
             os.getenv("LASTFM_API_KEY")
         ),
@@ -553,127 +623,86 @@ async def create_prompt(request: PromptRequest):
             "Enter a reference song or sound description"
         )
 
-    youtube = _youtube_url(request.song)
+    link = youtube_url(request.song)
 
-    if not youtube:
+    if not link:
         for word in request.notes.split():
-            youtube = _youtube_url(word)
-            if youtube:
+            link = youtube_url(word)
+            if link:
                 break
 
-    if youtube:
+    if link:
         listened = await asyncio.to_thread(
-            _gemini_listen,
-            youtube
+            gemini_listen, link
         )
 
-        if listened.get("status") != "analyzed":
+        if listened["status"] != "analyzed":
             raise HTTPException(
                 422,
-                (
-                    "YouTube listening did not complete: "
-                    + listened.get(
-                        "error",
-                        "Unknown error"
-                    )
-                )
+                "YouTube listening failed: "
+                + listened.get("error", "Unknown error")
             )
 
-        lastfm = await asyncio.to_thread(
-            _lookup_lastfm,
-            (
-                ""
-                if _youtube_url(request.song)
-                else request.song.strip()
-            ),
+        metadata = await asyncio.to_thread(
+            lookup_lastfm,
+            "" if youtube_url(request.song)
+            else request.song.strip(),
             request.artist.strip()
         )
 
         data = await generate({
-            "input_type": (
-                "Gemini analyzed YouTube video/audio; "
-                "use its report as primary evidence"
-            ),
+            "input_type": "Gemini YouTube audio analysis",
             **request.model_dump(),
             "gemini_audio_analysis": listened["report"],
-            "lastfm": lastfm,
+            "lastfm": metadata,
             "instruction": (
-                "The Gemini listening report is PRIMARY. "
-                "Write precise, differentiated production "
-                "and section tags based on what was heard. "
-                "Do not insert house-style clichés. "
-                "Preserve uncertainty. "
-                "User settings are adaptation preferences, "
-                "not claims about the reference."
+                "Base the Suno style prompt and each section "
+                "tag on the Gemini listening report. "
+                "Preserve its distinctive musical features. "
+                "Use detailed concrete descriptions, not "
+                "generic genre labels or preset arrangements."
             )
         })
 
-        data["reference_lookup"] = lastfm
-
+        data["reference_lookup"] = metadata
         data["audio_analysis"] = {
             "status": "analyzed",
-            "source": listened["source"],
-            "youtube_url": youtube,
-            "model": listened["model"]
+            "source": "Gemini YouTube audio/video input",
+            "model": listened["model"],
+            "youtube_url": link
         }
 
-        caveat = str(
-            data.get("caveat") or ""
-        ).strip()
-
         data["caveat"] = (
-            caveat
-            + " Gemini processed the public YouTube "
-            "reference; its sonic descriptions are AI "
-            "listening interpretations, not exact measurements."
+            data["caveat"]
+            + " Gemini processed the public YouTube reference; "
+            "descriptions are AI listening interpretations."
         ).strip()
 
         return data
 
-    lastfm = await asyncio.to_thread(
-        _lookup_lastfm,
+    metadata = await asyncio.to_thread(
+        lookup_lastfm,
         request.song.strip(),
         request.artist.strip()
     )
 
     data = await generate({
-        "input_type": (
-            "track metadata and/or user description; "
-            "NO audio listening"
-        ),
+        "input_type": "metadata only; no recording listened to",
         **request.model_dump(),
-        "lastfm": lastfm,
+        "lastfm": metadata,
         "instruction": (
-            "Prioritize reference evidence. Last.fm tags "
-            "are user-generated descriptions, not evidence "
-            "of specific audible instruments or song sections. "
-            "Avoid default Cryptid Static arrangements "
-            "unless supported."
+            "Be explicit about the absence of audio analysis. "
+            "Do not present inferred instruments, sections "
+            "or production details as verified facts."
         )
     })
 
-    data["reference_lookup"] = lastfm
-
-    caveat = str(
-        data.get("caveat") or ""
-    ).strip()
-
-    disclosure = (
-        "No recording was listened to; production details "
-        "beyond supplied metadata/notes are suggestions, "
-        "not verified analysis."
-    )
-
-    if lastfm.get("status") != "found":
-        disclosure = (
-            "Last.fm lookup: "
-            + lastfm.get("status", "unknown")
-            + ". "
-            + disclosure
-        )
+    data["reference_lookup"] = metadata
 
     data["caveat"] = (
-        caveat + " " + disclosure
+        data["caveat"]
+        + " No recording was listened to; musical details "
+        "beyond supplied information are suggestions."
     ).strip()
 
     return data
@@ -693,32 +722,18 @@ async def analyze_audio(
         or not 1 <= atmosphere <= 10
         or mode not in ("cryptid", "neutral")
     ):
-        raise HTTPException(
-            422,
-            "Invalid settings"
-        )
+        raise HTTPException(422, "Invalid settings")
 
     if len(notes) > 3000 or len(vocals) > 200:
-        raise HTTPException(
-            422,
-            "Text too long"
-        )
+        raise HTTPException(422, "Text too long")
 
-    raw = await audio.read(
-        MAX_AUDIO_BYTES + 1
-    )
+    raw = await audio.read(MAX_AUDIO_BYTES + 1)
 
     if len(raw) > MAX_AUDIO_BYTES:
-        raise HTTPException(
-            413,
-            "Audio exceeds 12 MB"
-        )
+        raise HTTPException(413, "Audio exceeds 12 MB")
 
     if not raw:
-        raise HTTPException(
-            422,
-            "Empty audio"
-        )
+        raise HTTPException(422, "Empty audio")
 
     try:
         import librosa
@@ -734,66 +749,41 @@ async def analyze_audio(
         if len(y) < sr:
             raise ValueError("Audio too short")
 
-        tempo, _ = librosa.beat.beat_track(
-            y=y,
-            sr=sr
-        )
-
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         rms = librosa.feature.rms(y=y)[0]
-
         centroid = librosa.feature.spectral_centroid(
-            y=y,
-            sr=sr
+            y=y, sr=sr
         )[0]
-
-        zcr = librosa.feature.zero_crossing_rate(
-            y
-        )[0]
+        zcr = librosa.feature.zero_crossing_rate(y)[0]
 
         features = {
-            "analyzed_seconds": round(
-                len(y) / sr,
-                1
-            ),
+            "analyzed_seconds": round(len(y) / sr, 1),
             "estimated_tempo_bpm": round(
-                float(
-                    np.asarray(tempo).reshape(-1)[0]
-                ),
-                1
+                float(np.asarray(tempo).reshape(-1)[0]), 1
             ),
-            "average_rms": round(
-                float(np.mean(rms)),
-                4
-            ),
+            "average_rms": round(float(np.mean(rms)), 4),
             "dynamic_rms_p10_p90": [
                 round(float(v), 4)
-                for v in np.percentile(
-                    rms,
-                    [10, 90]
-                )
+                for v in np.percentile(rms, [10, 90])
             ],
             "spectral_centroid_hz": round(
                 float(np.mean(centroid))
             ),
             "zero_crossing_rate": round(
-                float(np.mean(zcr)),
-                4
+                float(np.mean(zcr)), 4
             )
         }
 
     except Exception as exc:
         raise HTTPException(
             422,
-            (
-                "Could not decode audio. Try WAV, "
-                "or install FFmpeg for MP3 support."
-            )
+            "Could not decode audio. Try a WAV file."
         ) from exc
 
     return await generate({
         "input_type": (
             "audio feature measurements, "
-            "NOT full perceptual listening"
+            "not full perceptual listening"
         ),
         "features": features,
         "notes": notes,
@@ -802,9 +792,7 @@ async def analyze_audio(
         "atmosphere": atmosphere,
         "mode": mode,
         "instruction": (
-            "Metrics do not establish vocal gender, "
-            "instrumentation, guitar tuning or exact genre. "
-            "Treat those as preferences or inferences, "
-            "not measured facts."
+            "Do not infer exact instruments, vocal identity, "
+            "genre or tuning from numerical features alone."
         )
     })
